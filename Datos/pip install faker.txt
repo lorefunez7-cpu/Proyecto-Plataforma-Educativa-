@@ -1,0 +1,8 @@
+pip install faker
+python generar_datos.py inicializar      # una sola vez
+python generar_datos.py cargar-dia       # cada día, se puede repetir
+python generar_datos.py exportar-csv
+
+En Workbench ve a Edit → Preferences → SQL Editor y marca la casilla "Allow LOAD LOCAL INFILE", luego reinicia la conexión (cierra y abre la pestaña de la conexión).
+
+C:\ProgramData\MySQL\MySQL Server 8.0\Uploads (guardar los archivos ) 
