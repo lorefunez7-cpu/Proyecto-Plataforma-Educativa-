@@ -33,7 +33,7 @@ import argparse
 import csv
 import random
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from faker import Faker
@@ -351,18 +351,59 @@ def cargar_dia(conn: sqlite3.Connection, eventos_por_dia: int, fecha_forzada: st
         return
 
     cur = conn.cursor()
+
+    # Progreso de cada modulo junto con su 'orden' dentro del curso. Esto es
+    # clave: el aprendizaje debe respetar la secuencia (no tiene sentido que
+    # el modulo 3 este en curso si el modulo 1 nunca se empezo). Por eso el
+    # "modulo activo" de cada inscripcion es siempre el primero, en orden,
+    # que todavia no esta completado.
     filas = cur.execute(
-        "SELECT id_progreso_modulo, estado_modulo, porcentaje_avance_modulo FROM PROGRESO_MODULO"
+        """
+        SELECT pm.id_progreso_modulo, pm.id_inscripcion, pm.estado_modulo,
+               pm.porcentaje_avance_modulo, m.orden
+        FROM PROGRESO_MODULO pm
+        JOIN MODULO m ON m.id_modulo = pm.id_modulo
+        ORDER BY pm.id_inscripcion, m.orden
+        """
     ).fetchall()
-    ids_progreso = [f[0] for f in filas]
-    estado_por_progreso = {f[0]: f[1] for f in filas}
-    porcentaje_por_progreso = {f[0]: f[2] for f in filas}
+
+    estado_por_progreso = {}
+    porcentaje_por_progreso = {}
+    secuencia_por_inscripcion: dict[int, list[int]] = {}
+    for id_progreso, id_inscripcion, estado, pct, _orden in filas:
+        estado_por_progreso[id_progreso] = estado
+        porcentaje_por_progreso[id_progreso] = pct
+        secuencia_por_inscripcion.setdefault(id_inscripcion, []).append(id_progreso)
+
+    # indice_activo[id_inscripcion] = posicion (en la secuencia de modulos)
+    # del modulo que esa inscripcion esta cursando ahora mismo.
+    # Si ese modulo activo queda 'abandonado', la inscripcion se congela ahi
+    # (no se le generan mas eventos): asi el modulo donde se estanco queda
+    # registrado de forma clara y permanente, en vez de ser aleatorio.
+    indice_activo: dict[int, int] = {}
+    pool_activo: list[int] = []
+    for id_inscripcion, secuencia in secuencia_por_inscripcion.items():
+        idx = len(secuencia)
+        for pos, id_progreso in enumerate(secuencia):
+            if estado_por_progreso[id_progreso] != "completado":
+                idx = pos
+                break
+        indice_activo[id_inscripcion] = idx
+        if idx < len(secuencia) and estado_por_progreso[secuencia[idx]] != "abandonado":
+            pool_activo.append(id_inscripcion)
 
     siguiente_id_evento = (cur.execute("SELECT MAX(id_evento) FROM EVENTO_PROGRESO").fetchone()[0] or 0) + 1
 
     eventos, actualizaciones = [], []
     for _ in range(eventos_por_dia):
-        id_progreso = random.choice(ids_progreso)
+        if not pool_activo:
+            break  # todas las inscripciones ya completaron su curso o se estancaron
+
+        id_inscripcion = random.choice(pool_activo)
+        secuencia = secuencia_por_inscripcion[id_inscripcion]
+        idx = indice_activo[id_inscripcion]
+        id_progreso = secuencia[idx]
+
         estado_actual = estado_por_progreso[id_progreso]
         tipo_evento, nuevo_estado = _siguiente_estado(estado_actual)
 
@@ -386,6 +427,15 @@ def cargar_dia(conn: sqlite3.Connection, eventos_por_dia: int, fecha_forzada: st
         estado_por_progreso[id_progreso] = nuevo_estado
         porcentaje_por_progreso[id_progreso] = pct
         actualizaciones.append((nuevo_estado, round(pct, 2), fecha_a_cargar.isoformat(), id_progreso))
+
+        # Avanzar (o congelar) el puntero de secuencia de esta inscripcion
+        if nuevo_estado == "completado":
+            idx += 1
+            indice_activo[id_inscripcion] = idx
+            if idx >= len(secuencia):
+                pool_activo.remove(id_inscripcion)  # curso terminado (todos los modulos completados)
+        elif nuevo_estado == "abandonado":
+            pool_activo.remove(id_inscripcion)  # se estanco justo en este modulo, queda congelado
 
     cur.executemany(
         "INSERT INTO EVENTO_PROGRESO (id_evento, id_progreso_modulo, tipo_evento, fecha_evento, detalle) "
@@ -445,26 +495,39 @@ def _actualizar_avance_inscripciones(conn: sqlite3.Connection) -> None:
 def exportar_csv(conn: sqlite3.Connection) -> None:
     """Vuelca cada tabla completa a un .csv (con encabezado). No decide
     nada de negocio: la integracion/upsert hacia MySQL la hace el script
-    SQL (etl_integracion.sql), no este export."""
+    SQL (etl_integracion.sql), no este export.
+
+    Cada corrida se guarda en su PROPIA carpeta con fecha y hora exacta
+    (ej: csv_export/2026-09-15_17-59-03/), para que NINGUNA exportacion
+    se pierda ni se sobreescriba, aunque corras el comando varias veces
+    en el mismo dia (o en el mismo minuto)."""
     if not tiene_datos(conn):
         print("No hay datos todavia. Corre primero: python generar_datos.py inicializar")
         return
 
-    CSV_DIR.mkdir(exist_ok=True)
+    marca_tiempo = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    carpeta_fecha = CSV_DIR / marca_tiempo
+    carpeta_fecha.mkdir(parents=True, exist_ok=True)
+
     conn.row_factory = sqlite3.Row
     for tabla in TABLAS_EXPORTAR:
         filas = conn.execute(f"SELECT * FROM {tabla}").fetchall()
-        ruta = CSV_DIR / f"{tabla}.csv"
+        contenido_filas = []
+        if filas:
+            encabezado = list(filas[0].keys())
+            contenido_filas = [tuple(f) for f in filas]
+        else:
+            encabezado = [d[0] for d in conn.execute(f"SELECT * FROM {tabla} LIMIT 0").description]
+
+        ruta = carpeta_fecha / f"{tabla}.csv"
         with open(ruta, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f, lineterminator="\n")
-            if filas:
-                writer.writerow(filas[0].keys())
-                writer.writerows(tuple(f) for f in filas)
-            else:
-                writer.writerow([d[0] for d in conn.execute(f"SELECT * FROM {tabla} LIMIT 0").description])
-        print(f"  {tabla}: {len(filas)} filas -> {ruta.name}")
+            writer.writerow(encabezado)
+            writer.writerows(contenido_filas)
 
-    print(f"\nCSVs listos en: {CSV_DIR}")
+        print(f"  {tabla}: {len(filas)} filas -> {tabla}.csv")
+
+    print(f"\nCSVs de esta corrida guardados en: {carpeta_fecha}")
     print("Ahora corre etl_integracion.sql contra tu MySQL para integrarlos.")
 
 

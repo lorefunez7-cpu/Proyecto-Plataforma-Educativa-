@@ -28,6 +28,10 @@
 -- ============================================================
 
 USE plataforma_educativa;
+-- Configuraciones
+-- SET GLOBAL local_infile = 1;
+-- OPT_LOCAL_INFILE=1   ### esta linea debe ser agregada en >database > manage connections > servidor_local > advance > Others
+-- SET SQL_SAFE_UPDATES = 0;
 
 -- ------------------------------------------------------------
 -- 0) TABLAS STAGING (aterrizaje temporal de cada CSV)
