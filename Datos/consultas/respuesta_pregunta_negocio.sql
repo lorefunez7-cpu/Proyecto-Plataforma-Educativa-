@@ -45,7 +45,11 @@ ORDER BY c.nombre, estudiantes_estancados DESC;
 SELECT
     co.nombre                         AS cohorte,
     co.fecha_inicio,
+    co.cupo_maximo,
     COUNT(DISTINCT i.id_inscripcion)  AS inscripciones,
+    ROUND(
+        100.0 * COUNT(DISTINCT i.id_inscripcion) / NULLIF(co.cupo_maximo, 0), 1
+    )                                  AS pct_ocupacion_cupo,
     ROUND(AVG(i.porcentaje_avance_curso), 2) AS avance_promedio_pct,
     SUM(CASE WHEN i.estado_curso = 'completado' THEN 1 ELSE 0 END) AS completados,
     SUM(CASE WHEN i.estado_curso = 'en_curso'   THEN 1 ELSE 0 END) AS en_curso,
@@ -56,5 +60,5 @@ SELECT
     )                                  AS pct_abandono
 FROM INSCRIPCION i
 JOIN COHORTE co ON co.id_cohorte = i.id_cohorte
-GROUP BY co.id_cohorte, co.nombre, co.fecha_inicio
+GROUP BY co.id_cohorte, co.nombre, co.fecha_inicio, co.cupo_maximo
 ORDER BY co.fecha_inicio;

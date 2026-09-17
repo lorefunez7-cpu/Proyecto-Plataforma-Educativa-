@@ -21,6 +21,7 @@ SELECT
     co.nombre        AS cohorte,
     co.fecha_inicio   AS cohorte_inicio,
     co.fecha_fin      AS cohorte_fin,
+    co.cupo_maximo    AS cohorte_cupo_maximo,
 
     c.id_curso,
     c.nombre         AS curso,

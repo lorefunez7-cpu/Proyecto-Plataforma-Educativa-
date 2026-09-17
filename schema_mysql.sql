@@ -36,7 +36,8 @@ CREATE TABLE COHORTE (
     id_cohorte    INT PRIMARY KEY,
     nombre        VARCHAR(100) NOT NULL,
     fecha_inicio  DATE NOT NULL,
-    fecha_fin     DATE NOT NULL
+    fecha_fin     DATE NOT NULL,
+    cupo_maximo   INT
 ) ENGINE=InnoDB;
 
 CREATE TABLE CURSO (
@@ -102,7 +103,3 @@ CREATE TABLE etl_log (
     fecha_ejecucion_etl DATETIME NOT NULL,
     filas_evento        INT NOT NULL
 ) ENGINE=InnoDB;
-
-
-
-

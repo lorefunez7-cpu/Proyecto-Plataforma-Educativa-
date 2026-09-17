@@ -26,6 +26,14 @@ COMANDOS:
      y actualiza el progreso de los estudiantes. NO borra nada de lo
      que ya existia, solo agrega el dia nuevo.
 
+  3) Solo si EVENTO_PROGRESO local se vacio y sus id_evento volvieron a
+     empezar desde 1 (por ejemplo, si se borraron filas a mano):
+       python generar_datos.py resincronizar-eventos --offset <numero>
+
+     <numero> = el id_evento mas alto que ya tengas cargado en MySQL
+     (SELECT MAX(id_evento) FROM EVENTO_PROGRESO; alla). Esto evita que
+     el ETL ignore los eventos nuevos por chocar con ids ya subidos.
+
 Requisitos: Python 3.9+, faker  ->  pip install faker
 """
 
@@ -56,6 +64,30 @@ MODULOS_POR_CURSO = (4, 7)
 FECHA_INICIO_SIMULACION = date.today()
 EVENTOS_POR_DIA_DEFAULT = 1000
 
+# Cada dia, ademas de avanzar el progreso existente, algunos estudiantes se
+# inscriben en un curso nuevo (que todavia no han tomado). Esto evita que la
+# simulacion se "seque" cuando todas las inscripciones existentes ya
+# completaron su curso o quedaron congeladas por abandono.
+MAX_CURSOS_POR_ESTUDIANTE = 4
+NUEVAS_INSCRIPCIONES_POR_DIA = (2, 6)  # rango aleatorio de nuevas inscripciones por dia
+
+# Ademas, cada dia se registran estudiantes nuevos (gente que nunca habia
+# usado la plataforma), tal como pasa en la realidad. Esto es lo que evita
+# que la simulacion tenga techo: sin estudiantes nuevos, el mecanismo de
+# "nuevas inscripciones" tambien se termina agotando cuando todos los
+# estudiantes existentes llegan a MAX_CURSOS_POR_ESTUDIANTE.
+NUEVOS_ESTUDIANTES_POR_DIA = (0, 3)  # rango aleatorio de estudiantes nuevos por dia
+
+# Cada cohorte tiene un cupo maximo de inscripciones. Cuando la cohorte
+# "activa" (la mas reciente) llega a su cupo, se abre una cohorte nueva
+# automaticamente para que las inscripciones sigan cayendo en algun lado.
+CUPO_MAXIMO_POR_COHORTE = 200
+
+# Probabilidad, cada dia, de que se lance un curso nuevo (tomado de
+# CURSOS_FUTUROS). No todos los dias sale un curso nuevo en una plataforma
+# real, por eso es una probabilidad baja y no una cantidad fija.
+PROBABILIDAD_CURSO_NUEVO_POR_DIA = 0.08
+
 TEMAS_MODULO = [
     "Introduccion y objetivos", "Conceptos fundamentales", "Herramientas del entorno",
     "Practica guiada", "Casos de estudio", "Proyecto aplicado", "Evaluacion final",
@@ -75,6 +107,24 @@ CURSOS = [
     ("Gestion de Proyectos Agiles", "Negocios"),
     ("Excel Avanzado para Negocios", "Negocios"),
     ("Ciberseguridad Basica", "Tecnologia"),
+]
+
+# Cursos que la plataforma todavia no ofrece, pero que puede llegar a
+# lanzar mas adelante. cargar-dia los va agregando de a uno, de vez en
+# cuando (ver PROBABILIDAD_CURSO_NUEVO_POR_DIA), para que el catalogo
+# tambien pueda seguir creciendo en vez de quedarse fijo en los 12 de
+# CURSOS de arriba.
+CURSOS_FUTUROS = [
+    ("Introduccion a la Inteligencia Artificial", "Datos"),
+    ("Visualizacion de Datos con Power BI", "Datos"),
+    ("Desarrollo de Aplicaciones Moviles", "Programacion"),
+    ("Backend con Node.js", "Programacion"),
+    ("Diseno de Producto Digital", "Diseno"),
+    ("Animacion y Motion Graphics", "Diseno"),
+    ("Redes Sociales y Contenido Digital", "Negocios"),
+    ("Finanzas Personales", "Negocios"),
+    ("Cloud Computing Basico", "Tecnologia"),
+    ("Fundamentos de DevOps", "Tecnologia"),
 ]
 
 fake = Faker("es_ES")
@@ -97,7 +147,8 @@ CREATE TABLE IF NOT EXISTS COHORTE (
     id_cohorte    INTEGER PRIMARY KEY,
     nombre        VARCHAR(100) NOT NULL,
     fecha_inicio  DATE NOT NULL,
-    fecha_fin     DATE NOT NULL
+    fecha_fin     DATE NOT NULL,
+    cupo_maximo   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS CURSO (
@@ -173,6 +224,20 @@ def tiene_datos(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT COUNT(*) FROM ESTUDIANTE").fetchone()[0] > 0
 
 
+def _migrar_esquema(conn: sqlite3.Connection) -> None:
+    """Agrega columnas nuevas a bases creadas con una version anterior de
+    este script, sin borrar ni tocar los datos que ya existen."""
+    columnas = [f[1] for f in conn.execute("PRAGMA table_info(COHORTE)").fetchall()]
+    if "cupo_maximo" not in columnas:
+        conn.execute("ALTER TABLE COHORTE ADD COLUMN cupo_maximo INTEGER")
+        conn.execute(
+            "UPDATE COHORTE SET cupo_maximo = ? WHERE cupo_maximo IS NULL",
+            (CUPO_MAXIMO_POR_COHORTE,),
+        )
+        conn.commit()
+        print(f"  (migracion) Se agrego COHORTE.cupo_maximo = {CUPO_MAXIMO_POR_COHORTE} a las cohortes existentes.")
+
+
 # ============================================================
 # COMANDO: inicializar
 # ============================================================
@@ -216,15 +281,20 @@ def _poblar_estudiantes(conn, n):
 
 
 def _poblar_cohortes(conn, n):
+    # Todas las cohortes, desde el inicio, respetan el mismo cupo_maximo
+    # real (CUPO_MAXIMO_POR_COHORTE). La siembra inicial de inscripciones
+    # (mas abajo, en _poblar_inscripciones_y_progreso) tambien respeta este
+    # cupo, asi que ninguna cohorte queda con mas inscritos de los que
+    # declara poder tener.
     filas = []
     inicio = FECHA_INICIO_SIMULACION - timedelta(days=180)
     for i in range(1, n + 1):
         f_inicio = inicio + timedelta(days=30 * i)
         f_fin = f_inicio + timedelta(days=90)
         nombre = f"Cohorte {f_inicio.strftime('%Y')}-{((f_inicio.month - 1)//3)+1}-{i}"
-        filas.append((i, nombre, f_inicio.isoformat(), f_fin.isoformat()))
+        filas.append((i, nombre, f_inicio.isoformat(), f_fin.isoformat(), CUPO_MAXIMO_POR_COHORTE))
     conn.executemany(
-        "INSERT INTO COHORTE (id_cohorte, nombre, fecha_inicio, fecha_fin) VALUES (?,?,?,?)", filas
+        "INSERT INTO COHORTE (id_cohorte, nombre, fecha_inicio, fecha_fin, cupo_maximo) VALUES (?,?,?,?,?)", filas
     )
     conn.commit()
     print(f"  COHORTE: {len(filas)} filas")
@@ -270,23 +340,38 @@ def _poblar_modulos(conn, ids_curso):
     return modulos_por_curso
 
 
-def _cohorte_para_fecha(cohortes, fecha):
-    for id_cohorte, _n, f_inicio, f_fin in cohortes:
-        if date.fromisoformat(f_inicio) <= fecha <= date.fromisoformat(f_fin):
+def _cohorte_con_cupo(cohortes, fecha, ocupacion):
+    """Elige la cohorte mas cercana en fecha a 'fecha_inscripcion' que
+    todavia tenga cupo disponible (respeta cupo_maximo). Si la cohorte
+    "natural" (por rango de fechas) ya esta llena, el estudiante cae en la
+    siguiente cohorte mas cercana con espacio -- asi ninguna cohorte queda
+    nunca con mas inscritos de los que su cupo_maximo permite."""
+    candidatas = sorted(
+        cohortes,
+        key=lambda c: abs((date.fromisoformat(c[2]) - fecha).days),
+    )
+    for fila in candidatas:
+        id_cohorte, cupo_max = fila[0], fila[4]
+        if cupo_max is None or ocupacion.get(id_cohorte, 0) < cupo_max:
             return id_cohorte
-    return random.choice(cohortes)[0]
+    # No deberia pasar (NUM_COHORTES * CUPO_MAXIMO_POR_COHORTE alcanza para
+    # todos los estudiantes), pero por seguridad cae en la que tenga mas
+    # espacio relativo en vez de reventar.
+    return min(cohortes, key=lambda c: ocupacion.get(c[0], 0))[0]
 
 
 def _poblar_inscripciones_y_progreso(conn, ids_estudiante, ids_curso, cohortes, modulos_por_curso):
     inscripciones, progresos = [], []
     id_inscripcion = id_progreso = 1
+    ocupacion_cohorte = {fila[0]: 0 for fila in cohortes}
     for id_estudiante in ids_estudiante:
         for id_curso in random.sample(ids_curso, k=random.randint(1, 3)):
             fecha_inscripcion = fake.date_between(
                 start_date=FECHA_INICIO_SIMULACION - timedelta(days=150),
                 end_date=FECHA_INICIO_SIMULACION - timedelta(days=1),
             )
-            id_cohorte = _cohorte_para_fecha(cohortes, fecha_inscripcion)
+            id_cohorte = _cohorte_con_cupo(cohortes, fecha_inscripcion, ocupacion_cohorte)
+            ocupacion_cohorte[id_cohorte] += 1
             inscripciones.append((id_inscripcion, id_estudiante, id_curso, id_cohorte,
                                    fecha_inscripcion.isoformat(), "en_curso", 0.0))
             for id_modulo in modulos_por_curso[id_curso]:
@@ -333,6 +418,8 @@ def cargar_dia(conn: sqlite3.Connection, eventos_por_dia: int, fecha_forzada: st
     if not tiene_datos(conn):
         print("No hay datos base todavia. Corre primero: python generar_datos.py inicializar")
         return
+
+    _migrar_esquema(conn)
 
     if fecha_forzada:
         fecha_a_cargar = date.fromisoformat(fecha_forzada)
@@ -391,6 +478,191 @@ def cargar_dia(conn: sqlite3.Connection, eventos_por_dia: int, fecha_forzada: st
         indice_activo[id_inscripcion] = idx
         if idx < len(secuencia) and estado_por_progreso[secuencia[idx]] != "abandonado":
             pool_activo.append(id_inscripcion)
+
+    # ------------------------------------------------------------
+    # NUEVAS INSCRIPCIONES DEL DIA
+    # Algunos estudiantes se inscriben en un curso nuevo que no han
+    # tomado. Sin esto, una vez que todas las inscripciones existentes
+    # terminan (completan o se estancan), no queda nada que avanzar y
+    # cargar-dia deja de generar actividad.
+    # ------------------------------------------------------------
+    modulos_por_curso_actual: dict[int, list[int]] = {}
+    for id_modulo, id_curso, _orden in cur.execute(
+        "SELECT id_modulo, id_curso, orden FROM MODULO ORDER BY id_curso, orden"
+    ).fetchall():
+        modulos_por_curso_actual.setdefault(id_curso, []).append(id_modulo)
+
+    todos_los_cursos = list(modulos_por_curso_actual.keys())
+
+    # ------------------------------------------------------------
+    # CURSO NUEVO (ocasional)
+    # De vez en cuando el catalogo crece con un curso nuevo (tomado de
+    # CURSOS_FUTUROS), con sus propios modulos. Asi el catalogo no se queda
+    # fijo en los 12 cursos iniciales para siempre. Cuando ya no queda
+    # ningun curso pendiente en CURSOS_FUTUROS, este mecanismo simplemente
+    # deja de generar cursos (el resto de la simulacion sigue igual).
+    # ------------------------------------------------------------
+    nombres_curso_existentes = {n for (n,) in cur.execute("SELECT nombre FROM CURSO").fetchall()}
+    catalogo_pendiente = [c for c in CURSOS_FUTUROS if c[0] not in nombres_curso_existentes]
+
+    cursos_nuevos, modulos_de_cursos_nuevos = [], []
+    if catalogo_pendiente and random.random() < PROBABILIDAD_CURSO_NUEVO_POR_DIA:
+        nombre_curso_nuevo, categoria_curso_nueva = catalogo_pendiente[0]
+        id_curso_nuevo = (cur.execute("SELECT MAX(id_curso) FROM CURSO").fetchone()[0] or 0) + 1
+        descripcion_curso_nuevo = fake.sentence(nb_words=12)
+        cursos_nuevos.append((
+            id_curso_nuevo, nombre_curso_nuevo, descripcion_curso_nuevo,
+            categoria_curso_nueva, fecha_a_cargar.isoformat(),
+        ))
+
+        id_modulo_nuevo = (cur.execute("SELECT MAX(id_modulo) FROM MODULO").fetchone()[0] or 0) + 1
+        modulos_del_curso_nuevo = []
+        for orden in range(1, random.randint(*MODULOS_POR_CURSO) + 1):
+            nombre_modulo_nuevo = f"Modulo {orden}: {random.choice(TEMAS_MODULO)}"
+            descripcion_modulo_nuevo = fake.sentence(nb_words=10)
+            duracion_modulo_nuevo = random.choice([2, 3, 4, 5, 6, 8])
+            modulos_de_cursos_nuevos.append((
+                id_modulo_nuevo, id_curso_nuevo, nombre_modulo_nuevo,
+                orden, descripcion_modulo_nuevo, duracion_modulo_nuevo,
+            ))
+            modulos_del_curso_nuevo.append(id_modulo_nuevo)
+            id_modulo_nuevo += 1
+
+        modulos_por_curso_actual[id_curso_nuevo] = modulos_del_curso_nuevo
+        todos_los_cursos.append(id_curso_nuevo)
+
+        cur.executemany(
+            "INSERT INTO CURSO (id_curso, nombre, descripcion, categoria, fecha_creacion) VALUES (?,?,?,?,?)",
+            cursos_nuevos,
+        )
+        cur.executemany(
+            "INSERT INTO MODULO (id_modulo, id_curso, nombre, orden, descripcion, duracion_horas) VALUES (?,?,?,?,?,?)",
+            modulos_de_cursos_nuevos,
+        )
+
+    cursos_por_estudiante: dict[int, set] = {}
+    for id_estudiante, id_curso in cur.execute(
+        "SELECT id_estudiante, id_curso FROM INSCRIPCION"
+    ).fetchall():
+        cursos_por_estudiante.setdefault(id_estudiante, set()).add(id_curso)
+
+    todos_los_estudiantes = [
+        f[0] for f in cur.execute("SELECT id_estudiante FROM ESTUDIANTE").fetchall()
+    ]
+
+    # ------------------------------------------------------------
+    # ESTUDIANTES NUEVOS DEL DIA
+    # En la realidad la plataforma sigue recibiendo gente que se registra
+    # por primera vez, no solo estudiantes que ya estaban. Se agregan aqui,
+    # antes de generar las inscripciones nuevas, para que puedan inscribirse
+    # ese mismo dia.
+    # ------------------------------------------------------------
+    siguiente_id_estudiante = (cur.execute("SELECT MAX(id_estudiante) FROM ESTUDIANTE").fetchone()[0] or 0) + 1
+    nuevos_estudiantes = []
+    n_nuevos_estudiantes = random.randint(*NUEVOS_ESTUDIANTES_POR_DIA)
+    for _ in range(n_nuevos_estudiantes):
+        nombre, apellido = fake.first_name(), fake.last_name()
+        id_estudiante = siguiente_id_estudiante
+        email = f"{nombre.lower()}.{apellido.lower()}{id_estudiante}@correo.com".replace(" ", "")
+        nuevos_estudiantes.append((id_estudiante, nombre, apellido, email, fecha_a_cargar.isoformat()))
+        todos_los_estudiantes.append(id_estudiante)
+        siguiente_id_estudiante += 1
+
+    if nuevos_estudiantes:
+        cur.executemany(
+            "INSERT INTO ESTUDIANTE (id_estudiante, nombre, apellido, email, fecha_registro) VALUES (?,?,?,?,?)",
+            nuevos_estudiantes,
+        )
+
+    # ------------------------------------------------------------
+    # COHORTE ACTIVA (con cupo) para las inscripciones nuevas de hoy.
+    # Se usa la cohorte mas reciente mientras tenga espacio; en cuanto
+    # llega a su cupo_maximo se abre una cohorte nueva automaticamente.
+    # ------------------------------------------------------------
+    id_cohorte_activa, _nombre_c, _f_ini_c, _f_fin_c, cupo_maximo_activa = cur.execute(
+        "SELECT id_cohorte, nombre, fecha_inicio, fecha_fin, cupo_maximo FROM COHORTE ORDER BY id_cohorte DESC LIMIT 1"
+    ).fetchone()
+    ocupacion_cohorte_activa = cur.execute(
+        "SELECT COUNT(*) FROM INSCRIPCION WHERE id_cohorte = ?", (id_cohorte_activa,)
+    ).fetchone()[0]
+    cohortes_nuevas = []
+
+    siguiente_id_inscripcion = (cur.execute("SELECT MAX(id_inscripcion) FROM INSCRIPCION").fetchone()[0] or 0) + 1
+    siguiente_id_progreso = (cur.execute("SELECT MAX(id_progreso_modulo) FROM PROGRESO_MODULO").fetchone()[0] or 0) + 1
+
+    nuevas_inscripciones, nuevos_progresos_iniciales = [], []
+    n_nuevas = random.randint(*NUEVAS_INSCRIPCIONES_POR_DIA)
+    for _ in range(n_nuevas):
+        candidatos = [
+            e for e in todos_los_estudiantes
+            if len(cursos_por_estudiante.get(e, set())) < MAX_CURSOS_POR_ESTUDIANTE
+            and len(cursos_por_estudiante.get(e, set())) < len(todos_los_cursos)
+        ]
+        if not candidatos:
+            break  # ya nadie puede tomar mas cursos
+
+        id_estudiante = random.choice(candidatos)
+        cursos_disponibles = [c for c in todos_los_cursos if c not in cursos_por_estudiante.get(id_estudiante, set())]
+        id_curso = random.choice(cursos_disponibles)
+        cursos_por_estudiante.setdefault(id_estudiante, set()).add(id_curso)
+
+        if cupo_maximo_activa is not None and ocupacion_cohorte_activa >= cupo_maximo_activa:
+            id_cohorte_activa += 1
+            f_inicio_nueva = fecha_a_cargar
+            f_fin_nueva = fecha_a_cargar + timedelta(days=90)
+            nombre_nueva = (
+                f"Cohorte {f_inicio_nueva.strftime('%Y')}-"
+                f"{((f_inicio_nueva.month - 1)//3)+1}-{id_cohorte_activa}"
+            )
+            cupo_maximo_activa = CUPO_MAXIMO_POR_COHORTE
+            cohortes_nuevas.append((
+                id_cohorte_activa, nombre_nueva, f_inicio_nueva.isoformat(),
+                f_fin_nueva.isoformat(), cupo_maximo_activa,
+            ))
+            ocupacion_cohorte_activa = 0
+
+        id_cohorte = id_cohorte_activa
+        ocupacion_cohorte_activa += 1
+        id_inscripcion = siguiente_id_inscripcion
+        siguiente_id_inscripcion += 1
+        nuevas_inscripciones.append((
+            id_inscripcion, id_estudiante, id_curso, id_cohorte,
+            fecha_a_cargar.isoformat(), "en_curso", 0.0,
+        ))
+
+        secuencia = []
+        for id_modulo in modulos_por_curso_actual[id_curso]:
+            id_progreso = siguiente_id_progreso
+            siguiente_id_progreso += 1
+            nuevos_progresos_iniciales.append((
+                id_progreso, id_inscripcion, id_modulo,
+                "no_iniciado", 0.0, fecha_a_cargar.isoformat(),
+            ))
+            estado_por_progreso[id_progreso] = "no_iniciado"
+            porcentaje_por_progreso[id_progreso] = 0.0
+            secuencia.append(id_progreso)
+
+        secuencia_por_inscripcion[id_inscripcion] = secuencia
+        indice_activo[id_inscripcion] = 0
+        pool_activo.append(id_inscripcion)
+
+    if cohortes_nuevas:
+        cur.executemany(
+            "INSERT INTO COHORTE (id_cohorte, nombre, fecha_inicio, fecha_fin, cupo_maximo) VALUES (?,?,?,?,?)",
+            cohortes_nuevas,
+        )
+
+    if nuevas_inscripciones:
+        cur.executemany(
+            "INSERT INTO INSCRIPCION (id_inscripcion, id_estudiante, id_curso, id_cohorte, "
+            "fecha_inscripcion, estado_curso, porcentaje_avance_curso) VALUES (?,?,?,?,?,?,?)",
+            nuevas_inscripciones,
+        )
+        cur.executemany(
+            "INSERT INTO PROGRESO_MODULO (id_progreso_modulo, id_inscripcion, id_modulo, "
+            "estado_modulo, porcentaje_avance_modulo, fecha_actualizacion) VALUES (?,?,?,?,?,?)",
+            nuevos_progresos_iniciales,
+        )
 
     siguiente_id_evento = (cur.execute("SELECT MAX(id_evento) FROM EVENTO_PROGRESO").fetchone()[0] or 0) + 1
 
@@ -455,7 +727,13 @@ def cargar_dia(conn: sqlite3.Connection, eventos_por_dia: int, fecha_forzada: st
         (fecha_a_cargar.isoformat(), date.today().isoformat(), len(eventos)),
     )
     conn.commit()
-    print(f"Dia {fecha_a_cargar.isoformat()}: {len(eventos)} eventos cargados (sin borrar datos previos).")
+    print(
+        f"Dia {fecha_a_cargar.isoformat()}: {len(eventos)} eventos cargados, "
+        f"{len(nuevas_inscripciones)} inscripciones nuevas, "
+        f"{len(nuevos_estudiantes)} estudiantes nuevos, "
+        f"{len(cohortes_nuevas)} cohortes nuevas, "
+        f"{len(cursos_nuevos)} cursos nuevos (sin borrar datos previos)."
+    )
 
 
 def _actualizar_avance_inscripciones(conn: sqlite3.Connection) -> None:
@@ -532,13 +810,59 @@ def exportar_csv(conn: sqlite3.Connection) -> None:
 
 
 # ============================================================
+# COMANDO: resincronizar-eventos
+# ============================================================
+def resincronizar_eventos(conn: sqlite3.Connection, offset: int) -> None:
+    """Arregla el caso en que EVENTO_PROGRESO se vacio en la base LOCAL
+    (por ejemplo, si se borraron filas a mano tratando de "destrabar" la
+    simulacion) y sus id_evento volvieron a empezar desde 1. El problema:
+    esos ids chocan con los que ya subiste antes a MySQL, y como
+    etl_integracion.sql usa INSERT IGNORE con id_evento como llave, MySQL
+    los ve como "ya los tengo" y no sube nada nuevo -> por eso parece que
+    "no sube los datos".
+
+    Esto le suma 'offset' a TODOS los id_evento de tu tabla local, para que
+    ya no choquen con los que MySQL ya tiene. Se corre UNA sola vez.
+    offset = el id_evento mas alto que ya exista en tu MySQL (correlo alla:
+    SELECT MAX(id_evento) FROM EVENTO_PROGRESO;).
+    """
+    cur = conn.cursor()
+    total = cur.execute("SELECT COUNT(*) FROM EVENTO_PROGRESO").fetchone()[0]
+    if total == 0:
+        print("EVENTO_PROGRESO esta vacia localmente. No hay nada que resincronizar.")
+        return
+
+    minimo = cur.execute("SELECT MIN(id_evento) FROM EVENTO_PROGRESO").fetchone()[0]
+    if minimo > offset:
+        print(
+            f"Los id_evento locales ya empiezan en {minimo}, que es mayor al offset "
+            f"({offset}) que diste. No se hizo ningun cambio porque ya no colisionarian."
+        )
+        return
+
+    cur.execute("UPDATE EVENTO_PROGRESO SET id_evento = id_evento + ?", (offset,))
+    conn.commit()
+    nuevo_max = cur.execute("SELECT MAX(id_evento) FROM EVENTO_PROGRESO").fetchone()[0]
+    print(f"Listo: se le sumo {offset} a los {total} id_evento locales.")
+    print(f"Ahora van de {minimo + offset} a {nuevo_max} (ya no chocan con lo que subiste antes).")
+    print("Corre 'exportar-csv' de nuevo y luego etl_integracion.sql para subir estos eventos.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description="Generador de datos local - Plataforma educativa")
-    parser.add_argument("accion", choices=["inicializar", "cargar-dia", "exportar-csv"])
+    parser.add_argument(
+        "accion",
+        choices=["inicializar", "cargar-dia", "exportar-csv", "resincronizar-eventos"],
+    )
     parser.add_argument("--eventos-por-dia", type=int, default=EVENTOS_POR_DIA_DEFAULT)
     parser.add_argument("--fecha", type=str, default=None, help="Forzar una fecha especifica (YYYY-MM-DD)")
+    parser.add_argument(
+        "--offset", type=int, default=None,
+        help="Solo para resincronizar-eventos: el id_evento mas alto que ya tengas en MySQL",
+    )
     args = parser.parse_args()
 
     conn = conectar()
@@ -548,6 +872,12 @@ def main():
         cargar_dia(conn, args.eventos_por_dia, args.fecha)
     elif args.accion == "exportar-csv":
         exportar_csv(conn)
+    elif args.accion == "resincronizar-eventos":
+        if args.offset is None:
+            print("Falta --offset. Usa: python generar_datos.py resincronizar-eventos --offset <numero>")
+            print("Ese numero es el id_evento mas alto que ya tengas en MySQL (SELECT MAX(id_evento) FROM EVENTO_PROGRESO;).")
+        else:
+            resincronizar_eventos(conn, args.offset)
     conn.close()
 
 

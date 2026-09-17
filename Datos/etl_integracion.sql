@@ -28,17 +28,22 @@
 -- ============================================================
 
 USE plataforma_educativa;
--- Configuraciones
--- SET GLOBAL local_infile = 1;
--- OPT_LOCAL_INFILE=1   ### esta linea debe ser agregada en >database > manage connections > servidor_local > advance > Others
--- SET SQL_SAFE_UPDATES = 0;
 
 -- ------------------------------------------------------------
 -- 0) TABLAS STAGING (aterrizaje temporal de cada CSV)
 --    mismo shape que las tablas finales, sin llaves foraneas,
 --    para que LOAD DATA no falle por orden ni por FK
 -- ------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS stg_estudiante (
+-- NOTA IMPORTANTE: usamos DROP + CREATE (no "CREATE TABLE IF NOT EXISTS")
+-- para las tablas staging. Son tablas 100% temporales (se llenan y se
+-- tiran en cada corrida), asi que no hay ningun riesgo en recrearlas.
+-- La razon: "IF NOT EXISTS" NO actualiza una tabla que ya existe de una
+-- corrida anterior -- si mas adelante le agregamos una columna nueva
+-- (como paso con cupo_maximo), la tabla vieja se queda con la forma
+-- vieja para siempre y LOAD DATA empieza a fallar. DROP + CREATE evita
+-- ese problema de raiz, para hoy y para cualquier cambio futuro.
+DROP TABLE IF EXISTS stg_estudiante;
+CREATE TABLE stg_estudiante (
     id_estudiante   INT,
     nombre          VARCHAR(100),
     apellido        VARCHAR(100),
@@ -46,14 +51,35 @@ CREATE TABLE IF NOT EXISTS stg_estudiante (
     fecha_registro  DATE
 );
 
-CREATE TABLE IF NOT EXISTS stg_cohorte (
+DROP TABLE IF EXISTS stg_cohorte;
+CREATE TABLE stg_cohorte (
     id_cohorte    INT,
     nombre        VARCHAR(100),
     fecha_inicio  DATE,
-    fecha_fin     DATE
+    fecha_fin     DATE,
+    cupo_maximo   INT
 );
 
-CREATE TABLE IF NOT EXISTS stg_curso (
+-- Tu COHORTE de MySQL se creo antes de que existiera cupo_maximo.
+-- Esto le agrega la columna solo si todavia no la tiene (no borra nada).
+-- Se hace con SQL dinamico porque "ADD COLUMN IF NOT EXISTS" no existe
+-- en todas las versiones de MySQL (por eso te habia dado error de sintaxis).
+SET @existe_columna = (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'COHORTE'
+      AND COLUMN_NAME = 'cupo_maximo'
+);
+SET @sql_alter = IF(@existe_columna = 0,
+    'ALTER TABLE COHORTE ADD COLUMN cupo_maximo INT',
+    'SELECT 1'
+);
+PREPARE stmt_alter FROM @sql_alter;
+EXECUTE stmt_alter;
+DEALLOCATE PREPARE stmt_alter;
+
+DROP TABLE IF EXISTS stg_curso;
+CREATE TABLE stg_curso (
     id_curso        INT,
     nombre          VARCHAR(150),
     descripcion     VARCHAR(500),
@@ -61,7 +87,8 @@ CREATE TABLE IF NOT EXISTS stg_curso (
     fecha_creacion  DATE
 );
 
-CREATE TABLE IF NOT EXISTS stg_modulo (
+DROP TABLE IF EXISTS stg_modulo;
+CREATE TABLE stg_modulo (
     id_modulo        INT,
     id_curso         INT,
     nombre           VARCHAR(150),
@@ -70,7 +97,8 @@ CREATE TABLE IF NOT EXISTS stg_modulo (
     duracion_horas   INT
 );
 
-CREATE TABLE IF NOT EXISTS stg_inscripcion (
+DROP TABLE IF EXISTS stg_inscripcion;
+CREATE TABLE stg_inscripcion (
     id_inscripcion            INT,
     id_estudiante             INT,
     id_curso                  INT,
@@ -80,7 +108,8 @@ CREATE TABLE IF NOT EXISTS stg_inscripcion (
     porcentaje_avance_curso   DECIMAL(5,2)
 );
 
-CREATE TABLE IF NOT EXISTS stg_progreso_modulo (
+DROP TABLE IF EXISTS stg_progreso_modulo;
+CREATE TABLE stg_progreso_modulo (
     id_progreso_modulo        INT,
     id_inscripcion            INT,
     id_modulo                 INT,
@@ -89,22 +118,14 @@ CREATE TABLE IF NOT EXISTS stg_progreso_modulo (
     fecha_actualizacion       DATE
 );
 
-CREATE TABLE IF NOT EXISTS stg_evento_progreso (
+DROP TABLE IF EXISTS stg_evento_progreso;
+CREATE TABLE stg_evento_progreso (
     id_evento            INT,
     id_progreso_modulo   INT,
     tipo_evento          VARCHAR(30),
     fecha_evento         DATE,
     detalle              VARCHAR(255)
 );
-
--- limpiar staging de la corrida anterior
-TRUNCATE stg_estudiante;
-TRUNCATE stg_cohorte;
-TRUNCATE stg_curso;
-TRUNCATE stg_modulo;
-TRUNCATE stg_inscripcion;
-TRUNCATE stg_progreso_modulo;
-TRUNCATE stg_evento_progreso;
 
 -- ------------------------------------------------------------
 -- 1) EXTRACT: cargar cada CSV (ya copiado a la carpeta Uploads
@@ -162,8 +183,8 @@ IGNORE 1 LINES;
 INSERT IGNORE INTO ESTUDIANTE (id_estudiante, nombre, apellido, email, fecha_registro)
 SELECT id_estudiante, nombre, apellido, email, fecha_registro FROM stg_estudiante;
 
-INSERT IGNORE INTO COHORTE (id_cohorte, nombre, fecha_inicio, fecha_fin)
-SELECT id_cohorte, nombre, fecha_inicio, fecha_fin FROM stg_cohorte;
+INSERT IGNORE INTO COHORTE (id_cohorte, nombre, fecha_inicio, fecha_fin, cupo_maximo)
+SELECT id_cohorte, nombre, fecha_inicio, fecha_fin, cupo_maximo FROM stg_cohorte;
 
 INSERT IGNORE INTO CURSO (id_curso, nombre, descripcion, categoria, fecha_creacion)
 SELECT id_curso, nombre, descripcion, categoria, fecha_creacion FROM stg_curso;
